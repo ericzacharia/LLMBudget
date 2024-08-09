@@ -21,13 +21,10 @@ def find_recurring_transactions(data, num_months=2, similarity_threshold=78):
     data['Transaction Date'] = pd.to_datetime(data['Transaction Date'])
     # Extract year and month from 'Transaction Date' to create a YearMonth column
     data['YearMonth'] = data['Transaction Date'].dt.to_period('M').astype(str)
-    
     # Preprocess descriptions to remove varying parts
     data['ProcessedDescription'] = data['Description'].apply(preprocess_description)
-    
     # Get unique processed descriptions
     descriptions = data['ProcessedDescription'].unique()
-    
     # Create a mapping of similar descriptions
     similar_groups = {}
     for desc in descriptions:
@@ -111,6 +108,17 @@ def identify_subscriptions(df, tolerance=0.20, similarity_threshold=78):
     return subscriptions_df
 
 def process_file(file_path, num_months, tolerance):
+    """
+    Process a CSV files representing Checking and Credit Card statements to identify recurring transactions and subscriptions.
+    
+    The files used for this analysis came from Capital One statements. Adapt the code as needed for other banks statement formats.
+
+    This assumes that the CSV file has the following columns from Checking statements:
+    Transaction Date,Posted Date,Card No.,Description,Category,Debit,Credit
+
+    And the following columns from Credit Card statements:
+    Account Number,Transaction Description,Transaction Date,Transaction Type,Transaction Amount,Balance
+    """
     df = pd.read_csv(file_path)
     if 'Debit' not in df.columns:
         # Process files without a 'Debit' column by calculating the amount based on the transaction type
@@ -156,6 +164,17 @@ def concat_descriptions(descriptions):
     return ', '.join(sum(descriptions, []))
 
 def aggregate_files(uploaded_files, num_months, tolerance):
+    """
+    Aggregate the data from multiple uploaded files into a single DataFrame. 
+    Inputs:
+    - uploaded_files: List of uploaded CSV files
+    - num_months: Minimum number of months a transaction must have occurred in a year to be considered as a recurring transaction
+    - tolerance: The percentage the amount can differ between months for a transaction to be considered recurring
+
+    Returns:
+    - all_data: DataFrame with aggregated financial data
+    - original_data: DataFrame with the original data from the uploaded files for the purpose of later displaying the transactions for a selected month
+    """
     original_data = pd.DataFrame()
     all_data = pd.DataFrame()
     for uploaded_file in uploaded_files:
@@ -259,23 +278,32 @@ def plot_financial_data(data):
     return data
 
 def analyze_with_llm(df, model):
+    """
+    Analyze the financial data using the LLM model.
+    Inputs:
+    - df: DataFrame containing the financial data
+    - model: The model to use for analysis (either "OpenAI" or "Llama3.1")
+    Returns:
+    - analysis: The financial analysis provided by the model
+    """
     # Convert the dataframe to a CSV string
     csv_data = df.to_csv(index=False)
 
     if model == "OpenAI":
-        # Use OpenAI API to analyze the data
         response = openai.ChatCompletion.create(
-            model="gpt-4o",
+            model="gpt-4o-2024-08-06",
             messages=[
                     {"role": "system", "content": "You are an expert financial advisor."},
-                    {"role": "user", "content": f"These are the monthly recurring transactions for a single month: {csv_data} Please analyze it for any anomalies, providing any suggestions for budgeting and a summary of transactions"}
+                    {"role": "user", "content": f"These are the monthly recurring transactions for a single month: \
+                     {csv_data} Please analyze it for any anomalies, providing any suggestions for budgeting and a summary of transactions"}
                 ],
             )
         analysis = response['choices'][0]['message']['content'].strip()
     else:
         ollama_model = Ollama(model="llama3.1")
         # Define the prompt for the Ollama model
-        prompt = f"You are an expert financial advisor. Analyze the following monthly recurring transactions for anomalies and provide suggestions for budgeting and a summary of transactions:\n\n{csv_data}"
+        prompt = f"You are an expert financial advisor. \
+            Analyze the following monthly recurring transactions for anomalies and provide suggestions for budgeting and a summary of transactions:\n\n{csv_data}"
         # Use the Ollama model to analyze the data
         response = ollama_model.invoke(prompt)
         # Extract the analysis from the response
