@@ -1,13 +1,21 @@
+import re
+
 import streamlit as st
 import pandas as pd
-import seaborn as sns
-import matplotlib.pyplot as plt
 from fuzzywuzzy import fuzz, process
-import re
+import plotly.graph_objects as go
+import openai
+from langchain_community.llms import Ollama
+
+from openai_token import openai_api_key
+
+# Initialize OpenAI API
+openai.api_key = openai_api_key
 
 def preprocess_description(description):
     # Use regular expression to remove numbers (or any unique identifiers) and strip leading/trailing whitespace
     return re.sub(r'\d+', '', description).strip()
+
 def find_recurring_transactions(data, num_months=2, similarity_threshold=78):
     # Convert 'Transaction Date' to datetime
     data['Transaction Date'] = pd.to_datetime(data['Transaction Date'])
@@ -165,8 +173,6 @@ def aggregate_files(uploaded_files, num_months, tolerance):
     }).reset_index()
     
     return all_data, original_data
-import plotly.express as px
-import plotly.graph_objects as go
 
 def plot_financial_data(data):
     # Convert 'YearMonth' to string if not already
@@ -244,15 +250,53 @@ def plot_financial_data(data):
     # Show the plot in the Streamlit app
     st.plotly_chart(fig, use_container_width=True)
     data = data.drop(columns=['Description', 'Amount'])
-    st.dataframe(data, width=1000, height=492, hide_index=True)
+    # Format the amounts as currency
+    data['Recurring Income'] = data['Recurring Income'].apply(lambda x: '$ {:,.2f}'.format(x))
+    data['Recurring Expenses'] = data['Recurring Expenses'].apply(lambda x: '$ {:,.2f}'.format(x))
+    data['Spending Cash'] = data['Spending Cash'].apply(lambda x: '$ {:,.2f}'.format(x))
+    st.dataframe(data, width=1000, height=495, hide_index=True)
+
+    return data
+
+def analyze_with_llm(df, model):
+    # Convert the dataframe to a CSV string
+    csv_data = df.to_csv(index=False)
+
+    if model == "OpenAI":
+        # Use OpenAI API to analyze the data
+        response = openai.ChatCompletion.create(
+            model="gpt-4o",
+            messages=[
+                    {"role": "system", "content": "You are an expert financial advisor."},
+                    {"role": "user", "content": f"These are the monthly recurring transactions for a single month: {csv_data} Please analyze it for any anomalies, providing any suggestions for budgeting and a summary of transactions"}
+                ],
+            )
+        analysis = response['choices'][0]['message']['content'].strip()
+    else:
+        ollama_model = Ollama(model="llama3.1")
+        # Define the prompt for the Ollama model
+        prompt = f"You are an expert financial advisor. Analyze the following monthly recurring transactions for anomalies and provide suggestions for budgeting and a summary of transactions:\n\n{csv_data}"
+        # Use the Ollama model to analyze the data
+        response = ollama_model.invoke(prompt)
+        # Extract the analysis from the response
+        analysis = response.strip()
+    return analysis
 
 # Streamlit app
 st.title("Budget: Recurring Transactions")
-uploaded_files = st.file_uploader("Upload CSV files", accept_multiple_files=True, type=["csv"])
-# Slider to select the minimum number of months for recurring transactions
-num_months = st.slider('The minimum number of months a transaction must have occurred in a year to be considered as a recurring transaction:', min_value=2, max_value=12, value=2)
+col1, col2 = st.columns([1, 3])
+with col1:
+    # create toggle for OpenAI vs local analysis
+    model = st.radio("Select a Model", ("GPT-4o", "Llama3.1"))
+with col2:
+    uploaded_files = st.file_uploader("Upload CSV files", accept_multiple_files=True, type=["csv"])
+
 # Slider to select tolerance for amount variation between months
-tolerance = st.slider("Percent a recurring transaction amount can differ from a prior month's recurring transaction:", min_value=0.01, max_value=1.0, value=0.20, step=0.01)
+tolerance = st.slider("Monthly recurring transactions can sometimes vary in amount. Select the percentage the amount can differ between months:", min_value=0.01, max_value=1.0, value=0.20, step=0.01)
+
+# Slider to select the minimum number of months for recurring transactions
+# num_months = st.slider('Minimum number of months a transaction must have occurred in a year to be considered as a recurring transaction:', min_value=2, max_value=12, value=2)
+num_months = 2
 
 if uploaded_files:
     aggregated_data, original_data = aggregate_files(uploaded_files, num_months, tolerance)
@@ -262,12 +306,18 @@ if uploaded_files:
         st.write(f"Recurring Transactions for {selected_month}")
         # Filter original data by selected month
         original_data = original_data[original_data['YearMonth'].astype(str) == selected_month]
-        original_data['Amount'] = original_data['Amount'].round(2)  # Round amounts for display
+        original_data['Amount'] = original_data['Amount'].apply(lambda x: '$ {:,.2f}'.format(x))  # Round amounts for display
         original_data['Transaction Date'] = original_data['Transaction Date'].astype(str)
         display_data = original_data.drop(columns=['YearMonth'])  # Drop "YearMonth' column for display
         display_data = display_data[['Transaction Date', 'Description', 'Amount']]  # Reorder columns
-        st.dataframe(display_data, width=1000, height=247, hide_index=True)  # Display the data without index
-        plot_financial_data(aggregated_data)
+        st.dataframe(display_data, width=1000, height=250, hide_index=True)  # Display the data without index
+        data = plot_financial_data(aggregated_data)
+
+
+        # After the plot_financial_data function call
+        financial_analysis = analyze_with_llm(display_data, model)
+        st.subheader("LLM Financial Analysis:")
+        st.write(financial_analysis)
     else:
         st.write("No recurring expenses found in the uploaded files.")
 else:

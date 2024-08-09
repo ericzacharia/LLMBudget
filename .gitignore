@@ -1,3 +1,6 @@
+__pycache__/
 .vscode
 .DS_Store
-*.csv
+openai_token.py
+real_csv_statements
+faker.ipynb
