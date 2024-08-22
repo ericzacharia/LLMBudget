@@ -1,4 +1,5 @@
 import re
+from datetime import datetime
 
 import streamlit as st
 import pandas as pd
@@ -107,7 +108,7 @@ def identify_subscriptions(df, tolerance=0.20, similarity_threshold=78):
     subscriptions_df = pd.DataFrame(subscriptions).drop_duplicates()
     return subscriptions_df
 
-def process_file(file_path, num_months, tolerance):
+def process_file(file_path, num_months, tolerance, date_range):
     """
     Process a CSV files representing Checking and Credit Card statements to identify recurring transactions and subscriptions.
     
@@ -120,6 +121,11 @@ def process_file(file_path, num_months, tolerance):
     Account Number,Transaction Description,Transaction Date,Transaction Type,Transaction Amount,Balance
     """
     df = pd.read_csv(file_path)
+    # filter data based on the selected date range
+    start_date, end_date = [datetime.combine(d, datetime.min.time()) for d in date_range]
+    df['Transaction Date'] = pd.to_datetime(df['Transaction Date'])
+    df = df[(df['Transaction Date'] >= start_date) & (df['Transaction Date'] <= end_date)]
+
     if 'Debit' not in df.columns:
         # Process files without a 'Debit' column by calculating the amount based on the transaction type
         df['Amount'] = df.apply(lambda x: -x['Transaction Amount'] if x['Transaction Type'] == 'Debit' else x['Transaction Amount'], axis=1)
@@ -163,7 +169,7 @@ def concat_descriptions(descriptions):
     # Concatenate a list of descriptions into a single string
     return ', '.join(sum(descriptions, []))
 
-def aggregate_files(uploaded_files, num_months, tolerance):
+def aggregate_files(uploaded_files, num_months, tolerance, date_range):
     """
     Aggregate the data from multiple uploaded files into a single DataFrame. 
     Inputs:
@@ -178,11 +184,15 @@ def aggregate_files(uploaded_files, num_months, tolerance):
     original_data = pd.DataFrame()
     all_data = pd.DataFrame()
     for uploaded_file in uploaded_files:
-        file_data, copy_df = process_file(uploaded_file, num_months, tolerance)
+        file_data, copy_df = process_file(uploaded_file, num_months, tolerance, date_range)
         if file_data is not None:
             all_data = pd.concat([all_data, file_data], ignore_index=True)
             original_data = pd.concat([original_data, copy_df], ignore_index=True)
-    
+    # Filter data based on the selected date range
+    start_date, end_date = [datetime.combine(d, datetime.min.time()) for d in date_range]
+    original_data = original_data[(original_data['Transaction Date'] >= start_date) & (original_data['Transaction Date'] <= end_date)]
+    # st.dataframe(original_data)
+
     # Aggregate all data by year and month
     all_data = all_data.groupby('YearMonth').agg({
         'Description': concat_descriptions,
@@ -190,7 +200,6 @@ def aggregate_files(uploaded_files, num_months, tolerance):
         'Recurring Income': 'sum',
         'Recurring Expenses': 'sum'
     }).reset_index()
-    
     return all_data, original_data
 
 def plot_financial_data(data):
@@ -211,41 +220,23 @@ def plot_financial_data(data):
     # Create a figure with Plotly
     fig = go.Figure()
     
-    # Add the Recurring Income line with hover text
-    fig.add_trace(go.Scatter(
-        x=data['YearMonth'], 
-        y=data['Recurring Income'], 
-        mode='lines+markers',
-        name='Recurring Income',
-        line=dict(color=income_color),
-        fill='tozeroy',
-        hoverinfo='text',
-        text=data['Recurring Income']
-    ))
-
-    # Add the Recurring Expenses line with hover text
-    fig.add_trace(go.Scatter(
-        x=data['YearMonth'], 
-        y=-data['Recurring Expenses'], 
-        mode='lines+markers',
-        name='Recurring Expenses',
-        line=dict(color=expenses_color),
-        fill='tozeroy',
-        hoverinfo='text',
-        text=-data['Recurring Expenses']
-    ))
-
-    # Add the Spending Cash line with hover text
-    fig.add_trace(go.Scatter(
-        x=data['YearMonth'], 
-        y=data['Spending Cash'], 
-        mode='lines+markers',
-        name='Spending Cash',
-        line=dict(color=cash_color),
-        fill='tozeroy',
-        hoverinfo='text',
-        text=data['Spending Cash']
-    ))
+    def add_line_to_plot(fig, y, name, color, hover_text):
+        """
+        Add a line to a Plotly figure with specified x and y values, name, color, and hover text.
+        """
+        fig.add_trace(go.Scatter(
+            x=data['YearMonth'],
+            y=y,
+            mode='lines+markers',
+            name=name,
+            line=dict(color=color),
+            fill='tozeroy',
+            hoverinfo='text',
+            text=hover_text
+        ))
+    add_line_to_plot(fig, data['Recurring Income'], 'Recurring Income', income_color, data['Recurring Income'])
+    add_line_to_plot(fig, -data['Recurring Expenses'], 'Recurring Expenses', expenses_color, -data['Recurring Expenses'])
+    add_line_to_plot(fig, data['Spending Cash'], 'Spending Cash', cash_color, data['Spending Cash'])
 
     unique_months = sorted(data['YearMonth'].unique())  # Get unique months in order
 
@@ -310,43 +301,69 @@ def analyze_with_llm(df, model):
         analysis = response.strip()
     return analysis
 
-# Streamlit app
-st.title("Budget: Recurring Transactions")
-col1, col2 = st.columns([1, 3])
-with col1:
-    # create toggle for OpenAI vs local analysis
-    model = st.radio("Select a Model", ("GPT-4o", "Llama3.1"))
-with col2:
-    uploaded_files = st.file_uploader("Upload CSV files", accept_multiple_files=True, type=["csv"])
+def streamlit_app():
+    # Streamlit app
+    st.title("LLM Budget: Recurring Transactions")
+    col1, col2, col3 = st.columns([1.3, 2.1, 4])
+    with col1:
+        # create toggle for OpenAI vs local analysis
+        model = st.radio("Select a Model", ("GPT-4o", "Llama3.1"))
+    with col2:
+        # Set the minimum and maximum selectable dates
+        min_date = datetime(1990, 1, 1)
+        max_date = datetime.today()
 
-# Slider to select tolerance for amount variation between months
-tolerance = st.slider("Monthly recurring transactions can sometimes vary in amount. Select the percentage the amount can differ between months:", min_value=0.01, max_value=1.0, value=0.20, step=0.01)
+        # Set the default date range from january 1 of this year to today
+        default_range = (datetime(2000, 1, 1), datetime.today())
 
-# Slider to select the minimum number of months for recurring transactions
-# num_months = st.slider('Minimum number of months a transaction must have occurred in a year to be considered as a recurring transaction:', min_value=2, max_value=12, value=2)
-num_months = 2
-
-if uploaded_files:
-    aggregated_data, original_data = aggregate_files(uploaded_files, num_months, tolerance)
-    if not aggregated_data.empty:
-        # Select a month to view its recurring expenses
-        selected_month = st.selectbox("Select a month to view its recurring expenses", sorted(aggregated_data['YearMonth'].astype(str).unique(), reverse=True))
-        st.write(f"Recurring Transactions for {selected_month}")
-        # Filter original data by selected month
-        original_data = original_data[original_data['YearMonth'].astype(str) == selected_month]
-        original_data['Amount'] = original_data['Amount'].apply(lambda x: '$ {:,.2f}'.format(x))  # Round amounts for display
-        original_data['Transaction Date'] = original_data['Transaction Date'].astype(str)
-        display_data = original_data.drop(columns=['YearMonth'])  # Drop "YearMonth' column for display
-        display_data = display_data[['Transaction Date', 'Description', 'Amount']]  # Reorder columns
-        st.dataframe(display_data, width=1000, height=250, hide_index=True)  # Display the data without index
-        data = plot_financial_data(aggregated_data)
+        # Create a date range selector using st.date_input
+        date_range = st.date_input(
+            "Select a range of dates:",
+            value=default_range,
+            min_value=min_date,
+            max_value=max_date
+        )
+    with col3:
+        uploaded_files = st.file_uploader("Upload CSV files", accept_multiple_files=True, type=["csv"])
+    # Slider to select tolerance for amount variation between months
+    # tolerance = st.slider("Monthly recurring transactions can sometimes vary in amount. Select the percentage the amount can differ between months:", min_value=0.01, max_value=1.0, value=0.20, step=0.01)
+    tolerance = 0.20
 
 
-        # After the plot_financial_data function call
-        financial_analysis = analyze_with_llm(display_data, model)
-        st.subheader("LLM Financial Analysis:")
-        st.write(financial_analysis)
+    # Slider to select the minimum number of months for recurring transactions
+    # num_months = st.slider('Minimum number of months a transaction must have occurred in a year to be considered as a recurring transaction:', min_value=2, max_value=12, value=2)
+    num_months = 2
+
+    if uploaded_files:
+        aggregated_data, original_data = aggregate_files(uploaded_files, num_months, tolerance, date_range)
+        # sort the aggregated data by Amount    
+        if not aggregated_data.empty:
+            # Select a month to view its recurring expenses
+            selected_month = st.selectbox("Select a month to view its recurring expenses", sorted(aggregated_data['YearMonth'].astype(str).unique(), reverse=True), index=1)
+            st.write(f"Recurring Transactions for {selected_month}")
+            # Filter original data by selected month
+            original_data = original_data[original_data['YearMonth'].astype(str) == selected_month]
+            original_data['Transaction Date'] = original_data['Transaction Date'].astype(str)
+            display_data = original_data.drop(columns=['YearMonth'])  # Drop "YearMonth' column for display
+            display_data = display_data[['Transaction Date', 'Description', 'Amount']]  # Reorder columns
+            display_data_formatted = display_data.sort_values(by='Amount', ascending=False) # Sort by amount
+            display_data_formatted['Amount'] = display_data_formatted['Amount'].apply(lambda x: '$ {:,.2f}'.format(x))  # Round amounts for display
+            st.dataframe(display_data_formatted, width=1000, height=250, hide_index=True)  # Display the data without index
+            data = plot_financial_data(aggregated_data)
+
+
+            # After the plot_financial_data function call
+            financial_analysis = analyze_with_llm(display_data, model)
+            st.subheader("LLM Financial Analysis:")
+            st.write(financial_analysis)
+            if model == "OpenAI":
+                st.write("Powered by OpenAI's GPT-4o model.")
+            else:
+                st.write("Powered by the Llama3.1 model.")
+        else:
+            st.write("No recurring expenses found in the uploaded files.")
     else:
-        st.write("No recurring expenses found in the uploaded files.")
-else:
-    st.write("Please upload CSV files to analyze.")
+        st.write("Please upload CSV files to analyze.")
+
+if __name__ == '__main__':
+    streamlit_app()
