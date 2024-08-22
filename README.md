@@ -2,9 +2,9 @@
 
 LLMBudget is a financial data analysis tool designed to identify and visualize recurring transactions in your financial statements. It leverages Streamlit for the user interface, Plotly for interactive visualizations, and various Python libraries for data processing and analysis.
 
-![LLMBudget](BugetRecurringTransactions1.png)
-![LLMBudget](BugetRecurringTransactions2.png)
-![LLMBudget](BugetRecurringTransactions3.png)
+![LLMBudget](img/BugetRecurringTransactions1.png)
+![LLMBudget](img/BugetRecurringTransactions2.png)
+![LLMBudget](img/BugetRecurringTransactions3.png)
 
 ## Features
 
