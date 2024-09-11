@@ -1,253 +1,222 @@
 import re
 from datetime import datetime
 
-import streamlit as st
-import pandas as pd
-from fuzzywuzzy import fuzz, process
-import plotly.graph_objects as go
 import openai
+import joblib
+import pandas as pd
+import streamlit as st
+import plotly.graph_objects as go
+from fuzzywuzzy import fuzz, process
 from langchain_community.llms import Ollama
 
 from openai_token import openai_api_key
 
 
-def preprocess_description(description):
-    # Use regular expression to remove numbers (or any unique identifiers) and strip leading/trailing whitespace
-    return re.sub(r"\d+", "", description).strip()
+def get_recurring_transactions(df, num_months=2, tolerance=0.20, similarity_threshold=78):
+    """Finds recurring transactions in a DataFrame.
+    Returns: DataFrame with recurring transactions and a list of recurring transaction descriptions"""
 
+    def group_similar_descriptions(df, similarity_threshold=78):
+        """Groups similar descriptions together using the same description in the GroupedDescription column based on a similarity
+        threshold"""
 
-def find_recurring_transactions(data, num_months=2, similarity_threshold=78):
-    # Convert 'Transaction Date' to datetime
-    data["Transaction Date"] = pd.to_datetime(data["Transaction Date"])
-    # Extract year and month from 'Transaction Date' to create a YearMonth column
-    data["YearMonth"] = data["Transaction Date"].dt.to_period("M").astype(str)
-    # Preprocess descriptions to remove varying parts
-    data["ProcessedDescription"] = data["Description"].apply(preprocess_description)
-    # Get unique processed descriptions
-    descriptions = data["ProcessedDescription"].unique()
-    # Create a mapping of similar descriptions
-    similar_groups = {}
-    for desc in descriptions:
-        # Find the most similar description group based on the threshold
-        matched_desc = process.extractOne(
-            desc, similar_groups.keys(), scorer=fuzz.token_sort_ratio
-        )
-        if matched_desc and matched_desc[1] >= similarity_threshold:
-            # If similar description found, add the current description to that group
-            similar_groups[matched_desc[0]].append(desc)
-        else:
-            # If no similar description found, start a new group
-            similar_groups[desc] = [desc]
+        def preprocess_description(description):
+            """Uses regular expression to remove numbers (or any unique identifiers) and strip leading/trailing whitespace"""
+            return re.sub(r"\d+", "", description).strip()
 
-    def map_to_group(desc):
-        """Map descriptions in the dataframe to their groups"""
-        processed_desc = preprocess_description(desc)
-        for key, values in similar_groups.items():
-            if processed_desc in values:
-                return key
-        return desc  # Fallback to the original description if no match found
+        def map_to_group(desc):
+            processed_desc = preprocess_description(desc)
+            for key, values in similar_groups.items():
+                if processed_desc in values:
+                    return key
+            return desc
 
-    data["GroupedDescription"] = data["Description"].apply(map_to_group)
+        df["ProcessedDescription"] = df["Description"].apply(preprocess_description)
+        descriptions = df["ProcessedDescription"].unique()
+
+        # Create a mapping of similar descriptions
+        similar_groups = {}
+        for desc in descriptions:
+            matched_desc = process.extractOne(desc, similar_groups.keys(), scorer=fuzz.token_sort_ratio)
+            if matched_desc and matched_desc[1] >= similarity_threshold:
+                similar_groups[matched_desc[0]].append(desc)
+            else:
+                similar_groups[desc] = [desc]
+
+        df["GroupedDescription"] = df["Description"].apply(map_to_group)
+        return df
+
+    # Convert 'Transaction Date' to datetime and preprocess descriptions
+    df["Transaction Date"] = pd.to_datetime(df["Transaction Date"])
+    df = group_similar_descriptions(df, similarity_threshold=similarity_threshold)
 
     # Group by description and year/month and count occurrences
-    grouped = (
-        data.groupby(["GroupedDescription", "YearMonth"])
-        .size()
-        .reset_index(name="Count")
-    )
-    # Group by description to count the number of months each appears in
-    recurring = (
-        grouped.groupby(["GroupedDescription"]).size().reset_index(name="MonthCount")
-    )
-    # Filter to keep only descriptions that appear in the minimum number of months
-    recurring_costs = recurring[recurring["MonthCount"] >= num_months]
-    recurring_costs = recurring_costs["GroupedDescription"].tolist()
+    df["YearMonth"] = df["Transaction Date"].dt.to_period("M").astype(str)
+    grouped = df.groupby(["GroupedDescription", "YearMonth"]).size().reset_index(name="Count")
 
-    return recurring_costs
+    # Count the number of months each description appears in
+    recurring = grouped.groupby(["GroupedDescription"]).size().reset_index(name="MonthCount")
 
+    # Filter by the minimum number of months for recurring transactions
+    recurring_transaction_descriptions = recurring[recurring["MonthCount"] >= num_months]["GroupedDescription"].tolist()
+    # Filter DataFrame by recurring expenses
+    df = df[df["GroupedDescription"].isin(recurring_transaction_descriptions)]
 
-def identify_subscriptions(df, tolerance=0.20, similarity_threshold=78):
-    # Convert 'Transaction Date' to datetime
-    df["Transaction Date"] = pd.to_datetime(df["Transaction Date"])
-    df["ProcessedDescription"] = df["Description"].apply(preprocess_description)
-
-    # Get unique processed descriptions
-    descriptions = df["ProcessedDescription"].unique()
-
-    # Create a mapping of similar descriptions
-    similar_groups = {}
-
-    for desc in descriptions:
-        # Find the most similar description group based on the threshold
-        matched_desc = process.extractOne(
-            desc, similar_groups.keys(), scorer=fuzz.token_sort_ratio
-        )
-        if matched_desc and matched_desc[1] >= similarity_threshold:
-            # If similar description found, add the current description to that group
-            similar_groups[matched_desc[0]].append(desc)
-        else:
-            # If no similar description found, start a new group
-            similar_groups[desc] = [desc]
-
-    def map_to_group(desc):
-        """Map descriptions in the dataframe to their groups"""
-        processed_desc = preprocess_description(desc)
-        for key, values in similar_groups.items():
-            if processed_desc in values:
-                return key
-        return desc  # Fallback to the original description if no match found
-
-    df["GroupedDescription"] = df["Description"].apply(map_to_group)
-
-    subscriptions = []
+    # Identify recurring transactions based on amounts and date differences
+    recurring_transactions = []
     grouped = df.groupby("GroupedDescription")
 
     for name, group in grouped:
-        group = group.sort_values(
-            by="Transaction Date"
-        )  # Ensure transactions are sorted by date
+        group = group.sort_values(by="Transaction Date")
         amounts = group["Amount"].values
         dates = group["Transaction Date"].values
 
         for i in range(len(amounts) - 1):
             # Check if the amounts are within the tolerance level
             if abs(amounts[i] - amounts[i + 1]) <= tolerance * abs(amounts[i]):
-                # Check if the difference in dates suggests a monthly or bi-weekly pattern
+                # Check for monthly or bi-weekly patterns
                 diff = (dates[i + 1] - dates[i]).astype("timedelta64[D]").item().days
                 if (28 <= diff <= 32) or (13 <= diff <= 17):
-                    subscriptions.append(group.iloc[i])
-                    subscriptions.append(group.iloc[i + 1])
-    subscriptions_df = pd.DataFrame(subscriptions).drop_duplicates()
-    return subscriptions_df
+                    recurring_transactions.append(group.iloc[i])
+                    recurring_transactions.append(group.iloc[i + 1])
+    return pd.DataFrame(recurring_transactions).drop_duplicates(), recurring_transaction_descriptions
 
 
-def process_file(file_path, num_months, tolerance, date_range):
+def statement_to_recurring_transactions_df(file_path, num_months, tolerance, date_range):
     """
-    Process a CSV files representing Checking and Credit Card statements to identify recurring transactions and subscriptions.
-
-    The files used for this analysis came from Capital One statements. Adapt the code as needed for other banks statement formats.
-
-    This assumes that the CSV file has the following columns from Checking statements:
-    Transaction Date,Posted Date,Card No.,Description,Category,Debit,Credit
-
-    And the following columns from Credit Card statements:
-    Account Number,Transaction Description,Transaction Date,Transaction Type,Transaction Amount,Balance
+    Standardizes statement file columns, places recurring transactions into a DataFrame,
+    and also returns all transactions from the statement.
     """
+
+    def ai_classify_transactions(df):
+        """
+        Classify transaction descriptions for statements that don't have a category column using our trained SVM model.
+        """
+        # Convert the descriptions to a list
+        descriptions = df["Description"].tolist()
+        # Vectorize the descriptions using the loaded TF-IDF vectorizer
+        descriptions_tfidf = vectorizer.transform(descriptions)
+        # Predict the categories using the SVM model
+        categories = svm_clf.predict(descriptions_tfidf)
+        # Ensure all categories are valid, fallback to "Transfer" if necessary
+        valid_categories = ["Income", "Housing", "Utility", "Transfer", "P2P Expense"]
+        categories = [category if category in valid_categories else "Transfer" for category in categories]
+        return categories
+
+    # Read in the CSV file
     df = pd.read_csv(file_path)
-    # filter data based on the selected date range
-    start_date, end_date = [
-        datetime.combine(d, datetime.min.time()) for d in date_range
-    ]
-    df["Transaction Date"] = pd.to_datetime(df["Transaction Date"])
-    df = df[
-        (df["Transaction Date"] >= start_date) & (df["Transaction Date"] <= end_date)
-    ]
 
+    # Filter data based on the selected date range
+    start_date, end_date = [datetime.combine(d, datetime.min.time()) for d in date_range]
+    df["Transaction Date"] = pd.to_datetime(df["Transaction Date"])
+    df = df[(df["Transaction Date"] >= start_date) & (df["Transaction Date"] <= end_date)]
+
+    # Standardize file format depending on whether it has a 'Debit' column or not
     if "Debit" not in df.columns:
         # Process files without a 'Debit' column by calculating the amount based on the transaction type
         df["Amount"] = df.apply(
-            lambda x: -x["Transaction Amount"]
-            if x["Transaction Type"] == "Debit"
-            else x["Transaction Amount"],
+            lambda x: (-x["Transaction Amount"] if x["Transaction Type"] == "Debit" else x["Transaction Amount"]),
             axis=1,
         )
-        df = df.drop(
-            columns=[
-                "Account Number",
-                "Balance",
-                "Transaction Amount",
-                "Transaction Type",
-            ]
-        )
+        df = df.drop(columns=["Account Number", "Balance", "Transaction Amount", "Transaction Type"])
         df = df.rename(columns={"Transaction Description": "Description"})
     else:
         # Process files with a 'Debit' column by inverting the amounts to reflect expenses as negative
         df = df.dropna(subset=["Debit"])
         df = df.rename(columns={"Debit": "Amount"})
-        df = df.drop(columns=["Credit", "Card No.", "Posted Date", "Category"])
+        df = df.drop(columns=["Credit", "Card No.", "Posted Date"])
+
+        # Ensure that "Amount" is negative for expenses
         df["Amount"] = df["Amount"] * -1
 
-    # Find recurring transactions
-    recurring_expenses = find_recurring_transactions(df, num_months)
-    df["GroupedDescription"] = df["Description"].apply(
-        lambda x: preprocess_description(x)
-    )
-    df = df[df["GroupedDescription"].isin(recurring_expenses)]
-    df = df[
-        ["Amount", "Transaction Date", "YearMonth", "Description", "GroupedDescription"]
-    ]
-    df = df[["Amount", "Transaction Date", "YearMonth", "Description"]]
-    df = identify_subscriptions(df, tolerance)
+    # Ensure the 'Category' column exists, assigning "Transfer" as the default value if it doesn't
+    if "Category" not in df.columns:
+        # use the AI model to classify the transaction description into a category
+        df["Category"] = ai_classify_transactions(df)
+        # df["Category"] = "Transfer"
+    # Store all transactions in all_transactions_df (no filtering for recurring transactions)
+    all_transactions_df = df.copy()
 
-    # Make a copy of the df so we can display the subscriptions for a selected month
-    copy_df = df.copy()
-    if len(recurring_expenses) == 0:
-        return None, copy_df
+    # Find recurring transactions
+    recurring_transactions_df, recurring_transaction_descriptions = get_recurring_transactions(
+        df, num_months=num_months, tolerance=tolerance
+    )
+
+    # Shorten the name of the recurring transactions DataFrame for clarity
+    rt_df = recurring_transactions_df
+
+    # Make a copy of the recurring transactions DataFrame
+    rt_df_copy = recurring_transactions_df.copy()
+
+    if len(recurring_transaction_descriptions) == 0:
+        return all_transactions_df, None, rt_df_copy
 
     # Calculate recurring income and expenses
-    df["Recurring Income"] = (
-        df[df["Amount"] > 0].groupby("YearMonth")["Amount"].transform("sum")
-    )
-    df["Recurring Expenses"] = (
-        df[df["Amount"] < 0].groupby("YearMonth")["Amount"].transform("sum")
-    )
+    rt_df["Recurring Income"] = rt_df[rt_df["Amount"] > 0].groupby("YearMonth")["Amount"].transform("sum")
+    rt_df["Recurring Expenses"] = rt_df[rt_df["Amount"] < 0].groupby("YearMonth")["Amount"].transform("sum")
 
-    # Aggregate details by month
-    monthly_recurring_details = (
-        df.groupby("YearMonth")
+    # Aggregate recurring transaction details by month
+    monthly_recurring_transactions_df = (
+        rt_df.groupby("YearMonth")
         .agg(
             {
                 "Description": lambda x: list(x.unique()),
                 "Amount": "sum",
                 "Recurring Income": "first",
                 "Recurring Expenses": "first",
+                "Category": "first",
             }
         )
         .reset_index()
     )
 
-    return monthly_recurring_details, copy_df
+    return all_transactions_df, monthly_recurring_transactions_df, rt_df_copy
 
 
-def concat_descriptions(descriptions):
-    # Concatenate a list of descriptions into a single string
-    return ", ".join(sum(descriptions, []))
-
-
-def aggregate_files(uploaded_files, num_months, tolerance, date_range):
+def combine_statement_dfs(uploaded_statements, date_range, num_months=2, tolerance=0.20):
     """
-    Aggregate the data from multiple uploaded files into a single DataFrame.
-    Inputs:
-    - uploaded_files: List of uploaded CSV files
-    - num_months: Minimum number of months a transaction must have occurred in a year to be considered as a recurring transaction
-    - tolerance: The percentage the amount can differ between months for a transaction to be considered recurring
-
-    Returns:
-    - all_data: DataFrame with aggregated financial data
-    - original_data: DataFrame with the original data from the uploaded files for the purpose of later displaying the transactions for a selected month
+    Combines the dataframes from each uploaded statement into a single DataFrame.
     """
-    original_data = pd.DataFrame()
-    all_data = pd.DataFrame()
-    for uploaded_file in uploaded_files:
-        file_data, copy_df = process_file(
-            uploaded_file, num_months, tolerance, date_range
+
+    def concat_descriptions(descriptions):
+        # Concatenate a list of descriptions into a single string
+        return ", ".join(sum(descriptions, []))
+
+    # Initialize empty DataFrames
+    aggregated_recurring_transactions_df = pd.DataFrame()  # Aggregated recurring transactions by YearMonth
+    all_recurring_transactions_df = pd.DataFrame()  # Contains all recurring transactions ungrouped
+    all_transactions_df = pd.DataFrame()  # Contains all transactions from all statements
+
+    for uploaded_statement in uploaded_statements:
+        # statement_to_recurring_transactions_df should return all transactions and recurring transactions
+        all_transactions, monthly_recurring_transactions_df, rt_df_copy = statement_to_recurring_transactions_df(
+            uploaded_statement,
+            num_months,
+            tolerance,
+            date_range,
         )
-        if file_data is not None:
-            all_data = pd.concat([all_data, file_data], ignore_index=True)
-            original_data = pd.concat([original_data, copy_df], ignore_index=True)
-    # Filter data based on the selected date range
-    start_date, end_date = [
-        datetime.combine(d, datetime.min.time()) for d in date_range
-    ]
-    original_data = original_data[
-        (original_data["Transaction Date"] >= start_date)
-        & (original_data["Transaction Date"] <= end_date)
-    ]
-    # st.dataframe(original_data)
 
-    # Aggregate all data by year and month
-    all_data = (
-        all_data.groupby("YearMonth")
+        if all_transactions is not None:
+            # Concatenate all transactions into all_transactions_df
+            all_transactions_df = pd.concat([all_transactions_df, all_transactions], ignore_index=True)
+
+        if monthly_recurring_transactions_df is not None:
+            # Concatenate recurring transactions and their aggregated versions
+            aggregated_recurring_transactions_df = pd.concat(
+                [aggregated_recurring_transactions_df, monthly_recurring_transactions_df], ignore_index=True
+            )
+            all_recurring_transactions_df = pd.concat([all_recurring_transactions_df, rt_df_copy], ignore_index=True)
+
+    # Filter recurring transactions based on the selected date range
+    start_date, end_date = [datetime.combine(d, datetime.min.time()) for d in date_range]
+    all_recurring_transactions_df = all_recurring_transactions_df[
+        (all_recurring_transactions_df["Transaction Date"] >= start_date)
+        & (all_recurring_transactions_df["Transaction Date"] <= end_date)
+    ]
+
+    # Aggregate recurring transactions by year and month
+    aggregated_recurring_transactions_df = (
+        aggregated_recurring_transactions_df.groupby("YearMonth")
         .agg(
             {
                 "Description": concat_descriptions,
@@ -258,9 +227,10 @@ def aggregate_files(uploaded_files, num_months, tolerance, date_range):
         )
         .reset_index()
     )
-    return all_data, original_data
+    return aggregated_recurring_transactions_df, all_recurring_transactions_df, all_transactions_df
 
-def plot_financial_data(data):
+
+def plot_cash_flow(data):
     # Convert 'YearMonth' to string if not already
     data["YearMonth"] = data["YearMonth"].astype(str)
     data["Spending Cash"] = data["Amount"]  # Rename 'Amount' to 'Spending Cash'
@@ -309,14 +279,12 @@ def plot_financial_data(data):
         expenses_color,
         -data["Recurring Expenses"],
     )
-    add_line_to_plot(
-        fig, data["Spending Cash"], "Spending Cash", cash_color, data["Spending Cash"]
-    )
+    add_line_to_plot(fig, data["Spending Cash"], "Spending Cash", cash_color, data["Spending Cash"])
 
     unique_months = sorted(data["YearMonth"].unique())  # Get unique months in order
 
     fig.update_layout(
-        title="Monthly Financial Overview",
+        title="Monthly Recurring Cash Flow",
         xaxis_title="Month",
         yaxis_title="Amount",
         hovermode="x",
@@ -336,62 +304,64 @@ def plot_financial_data(data):
     st.plotly_chart(fig, use_container_width=True)
     data = data.drop(columns=["Description", "Amount"])
     # Format the amounts as currency
-    data["Recurring Income"] = data["Recurring Income"].apply(
-        lambda x: "$ {:,.2f}".format(x)
-    )
-    data["Recurring Expenses"] = data["Recurring Expenses"].apply(
-        lambda x: "$ {:,.2f}".format(x)
-    )
+    data["Recurring Income"] = data["Recurring Income"].apply(lambda x: "$ {:,.2f}".format(x))
+    data["Recurring Expenses"] = data["Recurring Expenses"].apply(lambda x: "$ {:,.2f}".format(x))
     data["Spending Cash"] = data["Spending Cash"].apply(lambda x: "$ {:,.2f}".format(x))
-    st.dataframe(data, width=1000, height=495, hide_index=True)
-
+    # Show a collapsible dataframe
+    with st.expander("Table: Monthly Recurring Cash Flow", expanded=False):
+        st.dataframe(data, width=1000, height=492, hide_index=True)
     return data
 
 
-def analyze_with_llm(df, model):
+def ai_financial_analyzer(all_rt_df, all_transactions_df, model):
     """
-    Analyze the financial data using the LLM model.
-    Inputs:
-    - df: DataFrame containing the financial data
-    - model: The model to use for analysis (either "GPT-4o" or "Llama 3.1")
-    Returns:
-    - analysis: The financial analysis provided by the model
+    Analyze the recurring transactions using the specified model.
     """
     # Convert the dataframe to a CSV string
-    csv_data = df.to_csv(index=False)
+    all_rt_csv = all_rt_df.to_csv(index=False)
+    all_transactions_csv = all_transactions_df.to_csv(index=False)
+
+    # Define the prompt to be used for both models
+    prompt = f"""You are an expert financial advisor. 
+Analyze the following table of Monthly Recurring Transactions and the table of All Transactions. 
+
+Monthly Recurring Transactions:
+{all_rt_csv}
+
+All Transactions:
+{all_transactions_csv}
+
+Do not describe the format of the data you are given.
+Identify the top spending categories, and if any: unusual spending behaviors and unnescessary purchases.
+Provide a summary of spending trends and budgeting recommendations for the user. 
+"""
 
     if model == "GPT-4o":
         response = openai.ChatCompletion.create(
             model="gpt-4o-2024-08-06",
             messages=[
                 {"role": "system", "content": "You are an expert financial advisor."},
-                {
-                    "role": "user",
-                    "content": f"These are the monthly recurring transactions for a single month: \
-                     {csv_data} Please analyze it for any anomalies, providing any suggestions for budgeting and a summary of transactions",
-                },
+                {"role": "user", "content": prompt},
             ],
         )
         analysis = response["choices"][0]["message"]["content"].strip()
     else:
-        ollama_model = Ollama(model="llama3.1")
-        # Define the prompt for the Ollama model
-        prompt = f"You are an expert financial advisor. \
-            Analyze the following monthly recurring transactions for anomalies and provide suggestions for budgeting and a summary of transactions:\n\n{csv_data}"
-        # Use the Ollama model to analyze the data
+        if model == "Llama 3.1 8b":
+            ollama_model = Ollama(model="llama3.1")
+        elif model == "Llama 3.1 70b":
+            ollama_model = Ollama(model="llama3.1:70b")
         response = ollama_model.invoke(prompt)
-        # Extract the analysis from the response
         analysis = response.strip()
+
     return analysis
 
 
 def streamlit_app():
-    # Streamlit app
-    st.title("LLM Budget: Recurring Transactions")
+    st.title("AI Financial Advisor")
     col1, col2, col3 = st.columns([1.3, 2.1, 4])
     with col1:
         # create toggle for OpenAI vs local/Meta analysis
-        model = st.radio("Select a Model", ("GPT-4o", "Llama 3.1"))
+        model = st.radio("Select a Model", ("GPT-4o", "Llama 3.1 8b", "Llama 3.1 70b"))
     with col2:
         # Set the minimum and maximum selectable dates
         min_date = datetime(1990, 1, 1)
@@ -409,57 +379,45 @@ def streamlit_app():
             format="MM/DD/YYYY",
         )
     with col3:
-        uploaded_files = st.file_uploader(
-            "Upload CSV files", accept_multiple_files=True, type=["csv"]
-        )
-    # Slider to select tolerance for amount variation between months
-    # tolerance = st.slider("Monthly recurring transactions can sometimes vary in amount. Select the percentage the amount can differ between months:", min_value=0.01, max_value=1.0, value=0.20, step=0.01)
-    tolerance = 0.20
+        uploaded_statements = st.file_uploader("Upload CSV files", accept_multiple_files=True, type=["csv"])
+    # tolerance = st.slider("""Monthly recurring transactions can sometimes vary in amount. Select the percentage the amount can
+    #                       differ between months:""", min_value=0.01, max_value=1.0, value=0.20, step=0.01)
+    # num_months = st.slider('''Minimum number of months a transaction must have occurred in a year to be considered as a recurring
+    #                        transaction:''', min_value=2, max_value=12, value=2)
 
-    # Slider to select the minimum number of months for recurring transactions
-    # num_months = st.slider('Minimum number of months a transaction must have occurred in a year to be considered as a recurring transaction:', min_value=2, max_value=12, value=2)
-    num_months = 2
-
-    if uploaded_files:
-        aggregated_data, original_data = aggregate_files(
-            uploaded_files, num_months, tolerance, date_range
-        )
+    if uploaded_statements:
+        aggregated_recurring_transactions_df, all_recurring_transactions_df, all_transactions_df = combine_statement_dfs(
+            uploaded_statements, date_range
+        )  # , num_months, tolerance)
+        # shorten name for the aggregated_recurring_transactions_df and all_recurring_transactions_df
+        agg_rt_df = aggregated_recurring_transactions_df
+        all_rt_df = all_recurring_transactions_df
         # sort the aggregated data by Amount
-        if not aggregated_data.empty:
+        if not agg_rt_df.empty:
             # Select a month to view its recurring expenses
             selected_month = st.selectbox(
                 "Select a month to view its recurring expenses",
-                sorted(aggregated_data["YearMonth"].astype(str).unique(), reverse=True),
-                index=1,
+                sorted(agg_rt_df["YearMonth"].astype(str).unique(), reverse=True),
+                index=1,  # default to the most recent completed month
             )
             st.write(f"Recurring Transactions for {selected_month}")
-            # Filter original data by selected month
-            original_data = original_data[
-                original_data["YearMonth"].astype(str) == selected_month
-            ]
-            original_data["Transaction Date"] = original_data[
-                "Transaction Date"
-            ].astype(str)
-            display_data = original_data.drop(
-                columns=["YearMonth"]
-            )  # Drop "YearMonth' column for display
-            display_data = display_data[
-                ["Transaction Date", "Description", "Amount"]
-            ]  # Reorder columns
-            display_data_formatted = display_data.sort_values(
-                by="Amount", ascending=False
-            )  # Sort by amount
-            display_data_formatted["Amount"] = display_data_formatted["Amount"].apply(
-                lambda x: "$ {:,.2f}".format(x)
-            )  # Round amounts for display
-            st.dataframe(
-                display_data_formatted, width=1000, height=250, hide_index=True
-            )  # Display the data without index
-            plot_financial_data(aggregated_data)
+            # Filter original data by selected month and format 'Transaction Date'
+            all_rt_df = all_rt_df[all_rt_df["YearMonth"].astype(str) == selected_month]
+            all_rt_df["Transaction Date"] = all_rt_df["Transaction Date"].astype(str)
 
-            # After the plot_financial_data function call
-            financial_analysis = analyze_with_llm(display_data, model)
-            st.subheader("LLM Financial Analysis:")
+            # Prepare data for display purposes by dropping 'YearMonth', reordering columns, and formatting 'Amount'
+            all_rt_df = all_rt_df.drop(columns=["YearMonth"])[["Transaction Date", "Description", "Category", "Amount"]]
+            all_transactions_df = all_transactions_df[["Transaction Date", "Description", "Category", "Amount"]]
+            all_rt_df_formatted = all_rt_df.sort_values(by="Amount", ascending=False)
+            all_rt_df_formatted["Amount"] = all_rt_df_formatted["Amount"].apply(lambda x: f"$ {x:,.2f}")
+
+            # Display the formatted data
+            st.dataframe(all_rt_df_formatted, width=1000, height=250, hide_index=True)
+            plot_cash_flow(agg_rt_df)
+
+            # After the plot_cash_flow function call
+            financial_analysis = ai_financial_analyzer(all_rt_df, all_transactions_df, model)
+            st.subheader("AI Financial Analysis:")
             st.write(financial_analysis)
 
             st.write(f"Powered by the {model} model.")
@@ -472,4 +430,7 @@ def streamlit_app():
 if __name__ == "__main__":
     # Initialize OpenAI API
     openai.api_key = openai_api_key
+    # Load the saved SVM model and vectorizer
+    svm_clf = joblib.load("svm_model.pkl")
+    vectorizer = joblib.load("tfidf_vectorizer.pkl")
     streamlit_app()
