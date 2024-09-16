@@ -148,7 +148,7 @@ def statement_to_recurring_transactions_df(file_path, num_months, tolerance, dat
     # Make a copy of the recurring transactions DataFrame
     rt_df_copy = recurring_transactions_df.copy()
 
-    if len(recurring_transaction_descriptions) == 0:
+    if rt_df.empty:
         return all_transactions_df, None, rt_df_copy
 
     # Calculate recurring income and expenses
